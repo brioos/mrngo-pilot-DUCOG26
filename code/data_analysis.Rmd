@@ -1,0 +1,818 @@
+---
+title: "MRNGO pilot data analysis"
+author: "Alex Ilyes"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Pre-requisits
+
+Here we include options, import neccessary packages, and prepare plotting styles
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(scales)
+```
+
+```{r plot-style}
+poster_cols <- c(
+  ink = "#111111",
+  paper = "#DFE6F2",
+  panel = "#F8F8F8",
+  mauve = "#BFAFC9",
+  blue = "#0072B2",
+  green = "#009E73",
+  sky = "#56B4E9",
+  gold = "#E69F00",
+  red = "#D55E00"
+)
+
+mrngo_theme <- function(base_size = 15) {
+  theme_classic(base_size = base_size, base_family = "Myriad Pro") +
+    theme(
+      plot.background = element_rect(fill = poster_cols["paper"], color = NA),
+      panel.background = element_rect(fill = poster_cols["panel"], color = NA),
+      panel.border = element_rect(fill = NA, color = poster_cols["ink"], linewidth = 0.5),
+      axis.line = element_line(color = poster_cols["ink"], linewidth = 0.65),
+      axis.ticks = element_line(color = poster_cols["ink"], linewidth = 0.65),
+      axis.text = element_text(color = poster_cols["ink"]),
+      axis.title = element_text(color = poster_cols["ink"], size = rel(1.08)),
+      strip.background = element_rect(fill = poster_cols["mauve"], color = NA),
+      strip.text = element_text(color = poster_cols["ink"], face = "bold", size = rel(1.02)),
+      legend.background = element_rect(fill = scales::alpha("white", 0), color = NA),
+      legend.key = element_rect(fill = scales::alpha("white", 0), color = NA)
+    )
+}
+
+p_value_label <- function(p) {
+  case_when(
+    is.na(p) ~ "p = NA",
+    p < .001 ~ "p < .001",
+    TRUE ~ paste0("p = ", sub("^0", "", sprintf("%.3f", p)))
+  )
+}
+
+block_labels <- c(run1 = "First block", run2 = "Repeat block")
+measure_labels <- c(RT = "MIC latency (sec)", ACC = "Accuracy (% correct)")
+block_cols <- c("First block" = "#0072B2", "Repeat block" = "#009E73")
+participant_mauve <- "#BFAFC9"
+participant_cols <- scales::hue_pal(l = 55, c = 80)
+
+test_label <- function(test) {
+  paste0("t(", round(unname(test$parameter), 1), ") = ", sprintf("%.2f", unname(test$statistic)), ", ", p_value_label(test$p.value))
+}
+
+cor_summary <- function(x, y) {
+  d <- tibble(x = x, y = y) %>% drop_na()
+
+  if (nrow(d) < 3 || sd(d$x) == 0 || sd(d$y) == 0) {
+    return(tibble(n = nrow(d), r = NA_real_, p = NA_real_))
+  }
+
+  test <- cor.test(d$x, d$y, method = "pearson")
+
+  tibble(
+    n = nrow(d),
+    r = unname(test$estimate),
+    p = test$p.value
+  )
+}
+
+partial_cor_summary <- function(x, y, z) {
+  d <- tibble(x = x, y = y, z = z) %>% drop_na()
+
+  if (nrow(d) < 4 || sd(d$x) == 0 || sd(d$y) == 0 || sd(d$z) == 0) {
+    return(tibble(n_partial = nrow(d), partial_r = NA_real_, partial_p = NA_real_))
+  }
+
+  x_resid <- resid(lm(x ~ z, data = d))
+  y_resid <- resid(lm(y ~ z, data = d))
+  test <- cor.test(x_resid, y_resid, method = "pearson")
+
+  tibble(
+    n_partial = nrow(d),
+    partial_r = unname(test$estimate),
+    partial_p = test$p.value
+  )
+}
+
+cor_label <- function(r, p, n) {
+  if_else(
+    is.na(r),
+    paste0("n = ", n, ", ", p_value_label(p)),
+    paste0("r = ", sprintf("%.2f", r), ", ", p_value_label(p), ", n = ", n)
+  )
+}
+```
+
+```{r figure-export-helper}
+save_figure <- function(plot, name, width, height) {
+  ggsave(file.path(figures_dir, paste0(name, ".png")), plot = plot, width = width, height = height, dpi = 300, bg = "white")
+  ggsave(file.path(figures_dir, paste0(name, ".pdf")), plot = plot, width = width, height = height, device = cairo_pdf, bg = "white")
+  svg_path <- file.path(figures_dir, paste0(name, ".svg"))
+  tryCatch(
+    ggsave(svg_path, plot = plot, width = width, height = height, bg = "white"),
+    error = function(e) {
+      grDevices::svg(svg_path, width = width, height = height, bg = "white")
+      print(plot)
+      grDevices::dev.off()
+    }
+  )
+}
+```
+
+# READ-IN
+
+We define paths for reading in preprocessed data.
+
+```{r paths}
+
+demography_path <- file.path("../derivatives", "mrngo_demography.xlsx")
+mic_path <- file.path("../derivatives", "MIC_preprocessed.xlsx")
+bar_path <- file.path("../derivatives", "BAR_preporcessed.xlsx")
+figures_dir <- file.path("../derivatives", "figures/")
+
+```
+
+MIC analyses include all participants (protocol unchanged). BAR analyses include only version 2 participants (due to change in task structure). 
+
+```{r read-data}
+demography_raw <- read_excel(demography_path)
+mic_raw <- read_excel(mic_path)
+bar_raw <- read_excel(bar_path)
+
+demography <- demography_raw %>%
+  transmute(
+    ID = as.character(ID),
+    version = as.numeric(version),
+    sex = as.factor(sex),
+    age_year = as.numeric(age_year),
+    age_month = as.numeric(age_months),
+    location = as.factor(location)
+  )
+
+version2_ids <- demography %>%
+  filter(version == 2) %>%
+  pull(ID)
+
+mic <- mic_raw %>%
+  mutate(
+    ID = as.character(ID),
+    run = as.integer(run),
+    trialno = as.integer(trialno),
+    conceptno = as.character(conceptno),
+    concept = as.character(concept),
+    concept_HU = as.character(concept_HU),
+    rt = as.numeric(rt),
+    correct = as.numeric(correct),
+    responded = as.numeric(responded),
+    run_label = paste0("run", dense_rank(run))
+  )
+
+bar <- bar_raw %>%
+  filter(ID %in% version2_ids) %>%
+  mutate(
+    ID = as.character(ID),
+    listno = as.integer(listno),
+    trialno = as.integer(trialno),
+    conceptno = as.character(conceptno),
+    concept = as.character(concept),
+    concept_HU = as.character(concept_HU),
+    responded = as.numeric(responded),
+    response = str_squish(str_to_lower(as.character(response))),
+    similarity = as.numeric(similarity)
+  )
+```
+
+# Demography Report
+
+```{r demography-summary}
+demography_overall <- demography %>%
+  summarise(
+    n = n(),
+    mean_age_month = mean(age_month, na.rm = TRUE),
+    sd_age_month = sd(age_month, na.rm = TRUE),
+    mean_age_year = mean(age_year, na.rm = TRUE),
+    sd_age_year = sd(age_year, na.rm = TRUE)
+  )
+
+sex_ratio_overall <- demography %>%
+  count(sex, name = "n") %>%
+  mutate(
+    proportion = n / sum(n),
+    percent = percent(proportion, accuracy = 0.1)
+  )
+
+demography_by_version <- demography %>%
+  group_by(version) %>%
+  summarise(
+    n = n(),
+    mean_age_month = mean(age_month, na.rm = TRUE),
+    sd_age_month = sd(age_month, na.rm = TRUE),
+    mean_age_year = mean(age_year, na.rm = TRUE),
+    sd_age_year = sd(age_year, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+sex_ratio_by_version <- demography %>%
+  count(version, sex, name = "n") %>%
+  group_by(version) %>%
+  mutate(
+    proportion = n / sum(n),
+    percent = percent(proportion, accuracy = 0.1)
+  ) %>%
+  ungroup()
+
+kable(demography_overall, digits = 2)
+kable(sex_ratio_overall)
+kable(demography_by_version, digits = 2)
+kable(sex_ratio_by_version)
+```
+
+# MIC Analysis
+
+MIC trials are filtered for reaction-time outliers using a 3 SD rule within each participant and run. Accuracy summaries use the same filtered trial set so that RT and ACC are computed from matching trials.
+
+```{r mic-outlier-filter}
+mic_filtered <- mic %>%
+  filter(!is.na(rt), !is.na(correct)) %>%
+  group_by(ID, run_label) %>%
+  mutate(
+    participant_run_mean_rt = mean(rt, na.rm = TRUE),
+    participant_run_sd_rt = sd(rt, na.rm = TRUE),
+    rt_outlier = if_else(
+      is.na(participant_run_sd_rt) | participant_run_sd_rt == 0,
+      FALSE,
+      abs(rt - participant_run_mean_rt) > 3 * participant_run_sd_rt
+    )
+  ) %>%
+  ungroup() %>%
+  filter(!rt_outlier)
+
+mic_outlier_report <- mic %>%
+  filter(!is.na(rt), !is.na(correct)) %>%
+  left_join(
+    mic_filtered %>%
+      mutate(kept_after_rt_filter = TRUE) %>%
+      select(ID, run_label, trialno, kept_after_rt_filter),
+    by = c("ID", "run_label", "trialno")
+  ) %>%
+  mutate(kept_after_rt_filter = replace_na(kept_after_rt_filter, FALSE)) %>%
+  group_by(ID, run_label) %>%
+  summarise(
+    trials_before_filter = n(),
+    trials_after_filter = sum(kept_after_rt_filter),
+    trials_removed = trials_before_filter - trials_after_filter,
+    .groups = "drop"
+  )
+
+kable(mic_outlier_report)
+```
+
+## Run 1 and Run 2 RT and Accuracy
+
+```{r mic-participant-run-summary}
+mic_participant_run <- mic_filtered %>%
+  group_by(ID, run_label) %>%
+  summarise(
+    mean_rt = mean(rt, na.rm = TRUE),
+    accuracy = mean(correct, na.rm = TRUE),
+    n_trials = n(),
+    .groups = "drop"
+  ) %>%
+  left_join(demography %>% select(ID, version, age_month, sex), by = "ID")
+
+mic_run_summary_long <- mic_participant_run %>%
+  pivot_longer(
+    cols = c(mean_rt, accuracy),
+    names_to = "measure",
+    values_to = "value"
+  ) %>%
+  mutate(
+    measure = recode(measure, mean_rt = "RT", accuracy = "ACC"),
+    measure = factor(measure, levels = c("RT", "ACC")),
+    measure_label = factor(recode(as.character(measure), !!!measure_labels), levels = measure_labels),
+    run_label = factor(run_label, levels = c("run1", "run2")),
+    block_label = factor(recode(as.character(run_label), !!!block_labels), levels = block_labels),
+    sex_label = factor(recode(as.character(sex), f = "Female", m = "Male", .default = as.character(sex))),
+    plot_value = if_else(measure == "ACC", value * 100, value)
+  )
+
+kable(mic_participant_run, digits = 3)
+```
+
+```{r mic-paired-tests}
+mic_run_wide <- mic_participant_run %>%
+  select(ID, run_label, mean_rt, accuracy) %>%
+  pivot_wider(
+    names_from = run_label,
+    values_from = c(mean_rt, accuracy)
+  ) %>%
+  drop_na(mean_rt_run1, mean_rt_run2, accuracy_run1, accuracy_run2)
+
+mic_rt_ttest <- t.test(mic_run_wide$mean_rt_run1, mic_run_wide$mean_rt_run2, paired = TRUE)
+mic_acc_ttest <- t.test(mic_run_wide$accuracy_run1, mic_run_wide$accuracy_run2, paired = TRUE)
+
+mic_paired_tests <- tibble(
+  measure = c("RT", "ACC"),
+  t = c(unname(mic_rt_ttest$statistic), unname(mic_acc_ttest$statistic)),
+  df = c(unname(mic_rt_ttest$parameter), unname(mic_acc_ttest$parameter)),
+  p = c(mic_rt_ttest$p.value, mic_acc_ttest$p.value),
+  label = c(test_label(mic_rt_ttest), test_label(mic_acc_ttest))
+)
+
+kable(mic_paired_tests, digits = 3)
+```
+
+```{r mic-run-barplots}
+mic_plot_summary <- mic_run_summary_long %>%
+  group_by(measure_label, block_label) %>%
+  summarise(
+    mean = mean(plot_value, na.rm = TRUE),
+    se = sd(plot_value, na.rm = TRUE) / sqrt(sum(!is.na(plot_value))),
+    .groups = "drop"
+  )
+
+mic_brackets <- mic_plot_summary %>%
+  group_by(measure_label) %>%
+  summarise(
+    y = max(mean + se, na.rm = TRUE) * 1.08,
+    .groups = "drop"
+  ) %>%
+  left_join(
+    mic_paired_tests %>%
+      mutate(measure_label = factor(recode(measure, !!!measure_labels), levels = measure_labels)) %>%
+      select(measure_label, label),
+    by = "measure_label"
+  ) %>%
+  mutate(x_start = 1, x_end = 2, x_mid = 1.5)
+
+p_mic_barplots <- ggplot(mic_plot_summary, aes(x = block_label, y = mean, fill = block_label)) +
+  geom_col(width = 0.62) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.08, linewidth = 1.05) +
+  geom_point(
+    data = mic_run_summary_long,
+    aes(x = block_label, y = plot_value),
+    inherit.aes = FALSE,
+    position = position_jitter(width = 0.05, height = 0),
+    size = 2.6,
+    alpha = 0.8,
+    color = participant_mauve
+  ) +
+  geom_segment(data = mic_brackets, aes(x = x_start, xend = x_end, y = y, yend = y), inherit.aes = FALSE, color = poster_cols["red"], linewidth = 1.05) +
+  geom_segment(data = mic_brackets, aes(x = x_start, xend = x_start, y = y * 0.99, yend = y), inherit.aes = FALSE, color = poster_cols["red"], linewidth = 1.05) +
+  geom_segment(data = mic_brackets, aes(x = x_end, xend = x_end, y = y * 0.99, yend = y), inherit.aes = FALSE, color = poster_cols["red"], linewidth = 1.05) +
+  geom_text(data = mic_brackets, aes(x = x_mid, y = y, label = label), inherit.aes = FALSE, vjust = -0.4, size = 4.5, color = poster_cols["red"], family = "Myriad Pro") +
+  facet_wrap(~ measure_label, scales = "free_y") +
+  scale_fill_manual(values = block_cols) +
+  labs(x = NULL, y = NULL) +
+  mrngo_theme(base_size = 15) +
+  theme(legend.position = "none")
+
+p_mic_barplots
+```
+
+## Fastest Correctly Recognized Items
+
+```{r mic-fastest-correct-items}
+mic_correct_item_rt <- mic_filtered %>%
+  filter(correct == 1, !is.na(rt)) %>%
+  group_by(concept, concept_HU) %>%
+  summarise(
+    mean_correct_rt = mean(rt, na.rm = TRUE),
+    sd_correct_rt = sd(rt, na.rm = TRUE),
+    n_correct = n(),
+    .groups = "drop"
+  )
+
+mic_fastest_correct_top5 <- mic_correct_item_rt %>%
+  slice_min(mean_correct_rt, n = 5, with_ties = FALSE) %>%
+  mutate(rank_type = "Fastest")
+
+mic_fastest_correct_bottom5 <- mic_correct_item_rt %>%
+  slice_max(mean_correct_rt, n = 5, with_ties = FALSE) %>%
+  mutate(rank_type = "Slowest")
+
+bind_rows(mic_fastest_correct_top5, mic_fastest_correct_bottom5) %>%
+  arrange(rank_type, mean_correct_rt) %>%
+  kable(digits = 3)
+```
+
+```{r mic-age-correlations}
+mic_correlations <- mic_run_summary_long %>%
+  filter(!is.na(age_month), !is.na(plot_value)) %>%
+  group_by(measure_label, block_label) %>%
+  summarise(cor_summary(age_month, plot_value), .groups = "drop") %>%
+  mutate(label = cor_label(r, p, n))
+
+mic_correlation_lines <- mic_run_summary_long %>%
+  filter(!is.na(age_month), !is.na(plot_value)) %>%
+  group_by(measure_label, block_label) %>%
+  group_modify(~ {
+    model <- lm(plot_value ~ age_month, data = .x)
+    x_vals <- range(.x$age_month, na.rm = TRUE)
+    tibble(
+      x = x_vals[1],
+      xend = x_vals[2],
+      y = predict(model, newdata = tibble(age_month = x_vals[1])),
+      yend = predict(model, newdata = tibble(age_month = x_vals[2]))
+    )
+  }) %>%
+  ungroup()
+
+plot_mic_correlation_block <- function(block_name) {
+  plot_data <- mic_run_summary_long %>% filter(block_label == block_name)
+  plot_lines <- mic_correlation_lines %>% filter(block_label == block_name)
+  plot_labels <- mic_correlations %>% filter(block_label == block_name)
+
+  ggplot(plot_data, aes(x = age_month, y = plot_value)) +
+    geom_point(size = 3.0, alpha = 0.82, color = participant_mauve) +
+    geom_segment(
+      data = plot_lines,
+      aes(x = x, xend = xend, y = y, yend = yend),
+      inherit.aes = FALSE,
+      color = poster_cols["ink"],
+      linewidth = 1.1
+    ) +
+    geom_text(
+      data = plot_labels,
+      aes(x = -Inf, y = Inf, label = label),
+      inherit.aes = FALSE,
+      hjust = -0.02,
+      vjust = 1.12,
+      size = 4.4,
+      family = "Myriad Pro"
+    ) +
+    facet_wrap(~ measure_label, scales = "free_y") +
+    labs(x = "Age (months)", y = NULL) +
+    mrngo_theme(base_size = 15) +
+    theme(legend.position = "none")
+}
+
+p_mic_correlations_run1 <- plot_mic_correlation_block("First block")
+p_mic_correlations_run2 <- plot_mic_correlation_block("Repeat block")
+
+p_mic_correlations_run1
+save_figure(p_mic_correlations_run1, "Figure1_MIC_correlations", width = 9, height = 5.2)
+
+p_mic_correlations_run2
+
+kable(mic_correlations %>% select(measure_label, block_label, n, r, p), digits = 3)
+```
+
+# BAR Analysis
+
+BAR analyses use version 2 participants only.
+
+## Guesses and Similarity Across Reveal Trials
+
+Bars show the average number of guesses across participants and lists. Lines show participant-level average response similarity by concept and trial number; exact responses are highlighted in gold.
+
+```{r bar-guesses-by-trial, fig.width=13, fig.height=6.5}
+bar_trial_list <- bar %>%
+  filter(trialno != 1) %>%
+  group_by(ID, listno, concept, trialno) %>%
+  summarise(
+    list_guesses = sum(responded == 1, na.rm = TRUE),
+    list_similarity = mean(similarity[responded == 1], na.rm = TRUE),
+    exact_response = any(similarity == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(list_similarity = if_else(is.nan(list_similarity), NA_real_, list_similarity))
+
+bar_trial_participant <- bar_trial_list %>%
+  group_by(ID, concept, trialno) %>%
+  summarise(
+    participant_mean_guesses = mean(list_guesses, na.rm = TRUE),
+    participant_mean_similarity = mean(list_similarity, na.rm = TRUE),
+    exact_response = any(exact_response, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(participant_mean_similarity = if_else(is.nan(participant_mean_similarity), NA_real_, participant_mean_similarity)) %>%
+  filter(!is.na(participant_mean_similarity)) %>%
+  mutate(participant_mean_similarity = if_else(
+    is.na(participant_mean_similarity),
+    NA_real_,
+    pmax(participant_mean_similarity, 0)
+  ))
+
+bar_trial_summary <- bar_trial_list %>%
+  group_by(concept, trialno) %>%
+  summarise(
+    mean_guesses = mean(list_guesses, na.rm = TRUE),
+    se_guesses = sd(list_guesses, na.rm = TRUE) / sqrt(sum(!is.na(list_guesses))),
+    .groups = "drop"
+  )
+
+p_bar_guesses_similarity <- ggplot(bar_trial_summary, aes(x = trialno, y = mean_guesses)) +
+  geom_col(fill = poster_cols["mauve"], width = 0.66) +
+  geom_errorbar(aes(ymin = mean_guesses - se_guesses, ymax = mean_guesses + se_guesses), width = 0.08, linewidth = 1.0) +
+  geom_line(
+    data = bar_trial_participant,
+    aes(x = trialno, y = participant_mean_similarity, color = ID, group = ID),
+    inherit.aes = FALSE,
+    linewidth = 0.9,
+    alpha = 0.42,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    data = bar_trial_participant %>% filter(!exact_response, !is.na(participant_mean_similarity)),
+    aes(x = trialno, y = participant_mean_similarity, color = ID),
+    inherit.aes = FALSE,
+    size = 2.2,
+    alpha = 0.72,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    data = bar_trial_participant %>% filter(exact_response, !is.na(participant_mean_similarity)),
+    aes(x = trialno, y = participant_mean_similarity),
+    inherit.aes = FALSE,
+    size = 3.8,
+    color = poster_cols["gold"],
+    alpha = 0.95,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(breaks = sort(unique(bar_trial_summary$trialno))) +
+  scale_color_manual(values = participant_cols(length(unique(bar_trial_participant$ID)))) +
+  facet_wrap(~ concept, ncol = 5) +
+  labs(x = "Trial number", y = "Average guesses / response similarity") +
+  mrngo_theme(base_size = 15) +
+  theme(legend.position = "none")
+
+p_bar_guesses_similarity
+save_figure(p_bar_guesses_similarity, "Figure2_BAR_guesses_similarity", width = 13, height = 6.5)
+
+p_bar_guesses_similarity_B <- ggplot() +
+  geom_line(
+    data = bar_trial_participant,
+    aes(x = trialno, y = participant_mean_similarity, color = ID, group = ID),
+    linewidth = 0.9,
+    alpha = 0.42,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    data = bar_trial_participant %>% filter(!exact_response, !is.na(participant_mean_similarity)),
+    aes(x = trialno, y = participant_mean_similarity, color = ID),
+    size = 2.2,
+    alpha = 0.72,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    data = bar_trial_participant %>% filter(exact_response, !is.na(participant_mean_similarity)),
+    aes(x = trialno, y = participant_mean_similarity),
+    size = 3.8,
+    color = poster_cols["gold"],
+    alpha = 0.95,
+    na.rm = TRUE
+  ) +
+  scale_x_continuous(breaks = sort(unique(bar_trial_summary$trialno))) +
+  scale_color_manual(values = participant_cols(length(unique(bar_trial_participant$ID)))) +
+  facet_wrap(~ concept, ncol = 5) +
+  labs(x = "Trial number", y = "Response similarity") +
+  mrngo_theme(base_size = 15) +
+  theme(legend.position = "none")
+
+p_bar_guesses_similarity_B
+save_figure(p_bar_guesses_similarity_B, "Figure2B_BAR_guesses_similarity_no_bars", width = 13, height = 6.5)
+```
+
+## Response Frequency by Concept and Similarity
+
+The `response` column is already in English, so responses are plotted directly from `bar`.
+
+```{r bar-response-translation, fig.width=13, fig.height=6.5}
+bar_response_words <- bar %>%
+  filter(responded == 1, !is.na(response), response != "") %>%
+  group_by(concept, response) %>%
+  summarise(
+    frequency = n(),
+    mean_similarity = mean(similarity, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_similarity = replace_na(mean_similarity, 0),
+    response_en = response
+  ) %>%
+  group_by(concept) %>%
+  arrange(desc(frequency), response, .by_group = TRUE) %>%
+  mutate(
+    angle = 2 * pi * (row_number() - 1) / pmax(n(), 1),
+    radius = 1 - pmin(pmax(mean_similarity, 0), 1),
+    x = radius * cos(angle),
+    y = radius * sin(angle)
+  ) %>%
+  ungroup()
+
+bar_response_base <- ggplot(
+  bar_response_words,
+  aes(x = x, y = y, label = response_en, size = frequency, color = mean_similarity)
+) +
+  facet_wrap(~ concept, ncol = 5) +
+  coord_equal(xlim = c(-1.18, 1.18), ylim = c(-1.18, 1.18)) +
+  scale_size_continuous(range = c(3.0, 8.0)) +
+  scale_color_gradient(low = poster_cols["blue"], high = poster_cols["red"], limits = c(0, 1)) +
+  labs(x = NULL, y = NULL) +
+  mrngo_theme(base_size = 15) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    axis.line = element_blank(),
+    legend.position = "none",
+    strip.text = element_text(family = "Myriad Pro", face = "bold"),
+    text = element_text(family = "Myriad Pro")
+  )
+
+p_bar_response_words <- if (requireNamespace("ggrepel", quietly = TRUE)) {
+  bar_response_base +
+    ggrepel::geom_text_repel(
+      family = "Myriad Pro",
+      fontface = "plain",
+      max.overlaps = Inf,
+      box.padding = 0.08,
+      point.padding = 0.02,
+      min.segment.length = Inf,
+      seed = 1
+    )
+} else {
+  bar_response_base +
+    geom_text(
+      family = "Myriad Pro",
+      fontface = "plain",
+      check_overlap = TRUE
+    )
+}
+
+p_bar_response_words
+save_figure(p_bar_response_words, "Figure3_BAR_response_similarity_words", width = 13, height = 6.5)
+```
+
+## BAR Participant Summaries
+
+```{r bar-participant-summaries}
+bar_participant_list <- bar %>%
+  group_by(ID, listno) %>%
+  summarise(
+    concept = first(concept),
+    response_number = sum(responded == 1, na.rm = TRUE),
+    exact_answer = any(similarity == 1, na.rm = TRUE),
+    mean_similarity = mean(similarity[responded == 1], na.rm = TRUE),
+    first_exact_reveal = if_else(
+      any(similarity == 1, na.rm = TRUE),
+      min(trialno[similarity == 1], na.rm = TRUE) / 10,
+      NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(mean_similarity = if_else(is.nan(mean_similarity), NA_real_, mean_similarity))
+
+bar_participant_summary <- bar_participant_list %>%
+  group_by(ID) %>%
+  summarise(
+    first_exact_reveal = mean(first_exact_reveal, na.rm = TRUE),
+    average_response_similarity = mean(mean_similarity, na.rm = TRUE),
+    bar_accuracy = mean(exact_answer, na.rm = TRUE),
+    average_response_number = mean(response_number, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(c(first_exact_reveal, average_response_similarity), ~ if_else(is.nan(.x), NA_real_, .x)))
+
+kable(bar_participant_summary, digits = 3)
+```
+
+# MIC vs BAR
+
+```{r mic-bar-correlations, fig.width=11, fig.height=5}
+mic_run1_summary <- mic_participant_run %>%
+  filter(run_label == "run1") %>%
+  select(ID, mic_latency = mean_rt, mic_acc = accuracy)
+
+mic_bar_summary <- mic_run1_summary %>%
+  inner_join(bar_participant_summary, by = "ID") %>%
+  left_join(demography %>% select(ID, age_month), by = "ID") %>%
+  filter(abs(mic_latency - mean(mic_latency, na.rm = TRUE)) <= 2 * sd(mic_latency, na.rm = TRUE)) %>%
+  mutate(age_group = factor(
+    if_else(age_month < 84, "Age below 7 years", "Age above 7 years"),
+    levels = c("Age below 7 years", "Age above 7 years")
+  ))
+
+mic_bar_age_cols <- c(
+  "Age below 7 years" = unname(poster_cols["blue"]),
+  "Age above 7 years" = unname(poster_cols["green"])
+)
+
+mic_bar_summary %>%
+  count(age_group) %>%
+  kable()
+
+mic_bar_long <- bind_rows(
+  mic_bar_summary %>%
+    transmute(
+      ID,
+      age_month,
+      age_group,
+      comparison = "CFC feature at first correct - MIC latency",
+      x_label = "CFC feature at first correct",
+      y_label = "MIC latency (sec)",
+      x = first_exact_reveal * 10,
+      y = mic_latency
+    ),
+  mic_bar_summary %>%
+    transmute(
+      ID,
+      age_month,
+      age_group,
+      comparison = "CFC average similarity - MIC accuracy",
+      x_label = "CFC average similarity",
+      y_label = "MIC accuracy (% correct)",
+      x = average_response_similarity,
+      y = mic_acc * 100
+    )
+)
+
+mic_bar_correlations <- mic_bar_long %>%
+  group_by(comparison, x_label, y_label) %>%
+  summarise(
+    cor_summary(x, y),
+    partial_cor_summary(x, y, age_month),
+    .groups = "drop"
+  ) %>%
+  mutate(label = paste0(
+    "r = ", sprintf("%.2f", r), ", ", p_value_label(p),
+    "\npartial r = ", sprintf("%.2f", partial_r), ", ", p_value_label(partial_p)
+  ))
+
+plot_mic_bar_panel <- function(comparison_name) {
+  plot_data <- mic_bar_long %>% filter(comparison == comparison_name)
+  plot_label <- mic_bar_correlations %>% filter(comparison == comparison_name)
+
+  ggplot(plot_data, aes(x = x, y = y)) +
+    geom_point(aes(color = age_group), size = 3.2, alpha = 0.9) +
+    geom_smooth(method = "lm", se = FALSE, color = poster_cols["ink"], linewidth = 1.15) +
+    geom_text(
+      data = plot_label,
+      aes(x = -Inf, y = Inf, label = label),
+      inherit.aes = FALSE,
+      hjust = -0.02,
+      vjust = 1.12,
+      size = 4.1,
+      family = "Myriad Pro"
+    ) +
+    scale_color_manual(values = mic_bar_age_cols, drop = FALSE, na.value = poster_cols["ink"]) +
+    labs(x = first(plot_data$x_label), y = first(plot_data$y_label), color = NULL) +
+    mrngo_theme(base_size = 15) +
+    theme(
+      plot.background = element_rect(fill = poster_cols["paper"], color = NA),
+      panel.background = element_rect(fill = poster_cols["panel"], color = NA),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.background = element_rect(fill = "white", color = poster_cols["ink"], linewidth = 0.4),
+      legend.box.background = element_rect(fill = "white", color = poster_cols["ink"], linewidth = 0.4),
+      legend.key = element_rect(fill = "white", color = NA)
+    )
+}
+
+p_mic_bar_latency <- plot_mic_bar_panel("CFC feature at first correct - MIC latency")
+p_mic_bar_accuracy <- plot_mic_bar_panel("CFC average similarity - MIC accuracy")
+
+p_mic_bar_correlations <- if (requireNamespace("patchwork", quietly = TRUE)) {
+  patchwork::wrap_plots(p_mic_bar_latency, p_mic_bar_accuracy, nrow = 1, guides = "collect") &
+    theme(
+      plot.background = element_rect(fill = poster_cols["paper"], color = NA),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.background = element_rect(fill = "white", color = poster_cols["ink"], linewidth = 0.4),
+      legend.box.background = element_rect(fill = "white", color = poster_cols["ink"], linewidth = 0.4)
+    )
+} else {
+  p_mic_bar_latency
+}
+
+p_mic_bar_correlations
+ggsave(file.path(figures_dir, "Figure5_MIC_BAR_correlations.png"), plot = p_mic_bar_correlations, width = 11, height = 5.8, dpi = 300, bg = poster_cols["paper"])
+ggsave(file.path(figures_dir, "Figure5_MIC_BAR_correlations.pdf"), plot = p_mic_bar_correlations, width = 11, height = 5.8, device = cairo_pdf, bg = poster_cols["paper"])
+tryCatch(
+  ggsave(file.path(figures_dir, "Figure5_MIC_BAR_correlations.svg"), plot = p_mic_bar_correlations, width = 11, height = 5.8, bg = poster_cols["paper"]),
+  error = function(e) {
+    grDevices::svg(file.path(figures_dir, "Figure5_MIC_BAR_correlations.svg"), width = 11, height = 5.8, bg = poster_cols["paper"])
+    print(p_mic_bar_correlations)
+    grDevices::dev.off()
+  }
+)
+
+kable(mic_bar_correlations %>% select(comparison, n, r, p, n_partial, partial_r, partial_p), digits = 3)
+```
