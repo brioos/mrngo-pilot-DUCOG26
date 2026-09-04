@@ -43,7 +43,7 @@ poster_cols <- c(
 )
 
 mrngo_theme <- function(base_size = 15) {
-  theme_classic(base_size = base_size, base_family = "Myriad Pro") +
+  theme_classic(base_size = base_size, base_family = "sans") +
     theme(
       plot.background = element_rect(fill = poster_cols["paper"], color = NA),
       panel.background = element_rect(fill = poster_cols["panel"], color = NA),
@@ -53,9 +53,19 @@ mrngo_theme <- function(base_size = 15) {
       axis.text = element_text(color = poster_cols["ink"]),
       axis.title = element_text(color = poster_cols["ink"], size = rel(1.08)),
       strip.background = element_rect(fill = poster_cols["mauve"], color = NA),
-      strip.text = element_text(color = poster_cols["ink"], face = "bold", size = rel(1.02)),
-      legend.background = element_rect(fill = scales::alpha("white", 0), color = NA),
-      legend.key = element_rect(fill = scales::alpha("white", 0), color = NA)
+      strip.text = element_text(
+        color = poster_cols["ink"],
+        face = "bold",
+        size = rel(1.02)
+      ),
+      legend.background = element_rect(
+        fill = scales::alpha("white", 0),
+        color = NA
+      ),
+      legend.key = element_rect(
+        fill = scales::alpha("white", 0),
+        color = NA
+      )
     )
 }
 
@@ -147,6 +157,8 @@ mic_path <- file.path("../derivatives", "MIC_preprocessed.xlsx")
 bar_path <- file.path("../derivatives", "BAR_preporcessed.xlsx")
 figures_dir <- file.path("../derivatives", "figures/")
 
+participants_summer <- c("P4647", "P7581", "P8504", "P4435", "P9581", "P3909")
+
 ```
 
 MIC analyses include all participants (protocol unchanged). BAR analyses include only version 2 participants (due to change in task structure). 
@@ -170,6 +182,14 @@ version2_ids <- demography %>%
   filter(version == 2) %>%
   pull(ID)
 
+version1_ids <- demography %>%
+  filter(version == 1) %>%
+  pull(ID)
+
+version3_ids <- demography %>%
+  filter(version == 3) %>%
+  pull(ID)
+
 mic <- mic_raw %>%
   mutate(
     ID = as.character(ID),
@@ -185,7 +205,7 @@ mic <- mic_raw %>%
   )
 
 bar <- bar_raw %>%
-  filter(ID %in% version2_ids) %>%
+  filter(ID %in% participants_summer) %>%
   mutate(
     ID = as.character(ID),
     listno = as.integer(listno),
@@ -692,7 +712,199 @@ bar_participant_summary <- bar_participant_list %>%
   mutate(across(c(first_exact_reveal, average_response_similarity), ~ if_else(is.nan(.x), NA_real_, .x)))
 
 kable(bar_participant_summary, digits = 3)
+
 ```
+
+# BAR version comparison
+
+```{r}
+bar_compare <- bar_raw %>%
+  mutate(
+    ID = as.character(ID),
+    listno = as.integer(listno),
+    trialno = as.integer(trialno),
+    concept = as.character(concept),
+    responded = as.numeric(responded),
+    similarity = as.numeric(similarity)
+  ) %>%
+  left_join(
+    demography %>% select(ID, version),
+    by = "ID"
+  )
+
+bar_trial <- bar_compare %>%
+  filter(trialno != 1) %>%
+  group_by(ID, version, listno, concept, trialno) %>%
+  summarise(
+    exact_now = any(responded == 1 & similarity == 1, na.rm = TRUE),
+    guesses = sum(responded == 1, na.rm = TRUE),
+    best_similarity = if_else(
+      any(responded == 1 & !is.na(similarity)),
+      max(similarity[responded == 1], na.rm = TRUE),
+      NA_real_
+    ),
+    .groups = "drop"
+  ) %>%
+  group_by(ID, version, listno, concept) %>%
+  arrange(trialno, .by_group = TRUE) %>%
+  mutate(
+    opportunity = row_number(),
+    n_opportunities = n(),
+    reveal_proportion = opportunity / n_opportunities,
+    exact_by_now = as.logical(cummax(exact_now))
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
+bar_curve <- bar_trial %>%
+  group_by(ID, version, reveal_proportion) %>%
+  summarise(
+    proportion_exact = mean(exact_by_now),
+    .groups = "drop"
+  )
+
+bar_curve_summary <- bar_curve %>%
+  group_by(version, reveal_proportion) %>%
+  summarise(
+    mean_exact = mean(proportion_exact),
+    se = sd(proportion_exact) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(
+  bar_curve_summary,
+  aes(reveal_proportion, mean_exact, color = factor(version))
+) +
+  geom_ribbon(
+    aes(
+      ymin = pmax(mean_exact - 1.96 * se, 0),
+      ymax = pmin(mean_exact + 1.96 * se, 1),
+      fill = factor(version)
+    ),
+    alpha = .15,
+    color = NA
+  ) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.4) +
+  scale_x_continuous(
+    labels = percent_format(),
+    limits = c(0, 1)
+  ) +
+  scale_y_continuous(
+    labels = percent_format(),
+    limits = c(0, 1))+
+  mrngo_theme() +
+  labs(
+    x = "Proportion of trial opportunities used",
+    y = "Concepts identified exactly",
+    color = "BAR version",
+    fill = "BAR version"
+  ) 
+
+save_figure(last_plot(), "Figure_BAR_learning_curve", width = 9, height = 5.2)
+```
+
+```{r}
+bar_by_six <- bar_trial %>%
+  filter(opportunity <= 6) %>%
+  group_by(ID, version, listno, concept) %>%
+  summarise(
+    exact_by_six = any(exact_now),
+    .groups = "drop"
+  ) %>%
+  group_by(ID, version) %>%
+  summarise(
+    accuracy_by_six = mean(exact_by_six),
+    n_concepts = n(),
+    .groups = "drop"
+  )
+
+ggplot(
+  bar_by_six,
+  aes(factor(version), accuracy_by_six, color = factor(version))
+) +
+  geom_boxplot(
+    width = .35,
+    outlier.shape = NA,
+    color = poster_cols["ink"]
+  ) +
+  geom_jitter(width = .08, height = 0, size = 2.7, alpha = .75) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 18,
+    size = 4,
+    color = poster_cols["ink"]
+  ) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    x = "BAR version",
+    y = "Exact-answer rate after six opportunities"
+  ) +
+  mrngo_theme() +
+  theme(legend.position = "none")
+save_figure(last_plot(), "Figure_BAR_accuracy_by_six", width = 9, height = 5.2)
+
+```
+
+```{r}
+bar_list_summary <- bar_trial %>%
+  group_by(ID, version, listno, concept) %>%
+  summarise(
+    n_opportunities = first(n_opportunities),
+    exact_answer = any(exact_now),
+    first_exact_opportunity = if_else(
+      exact_answer,
+      min(opportunity[exact_now]),
+      NA_integer_
+    ),
+    proportion_used = if_else(
+      exact_answer,
+      first_exact_opportunity / n_opportunities,
+      NA_real_
+    ),
+    guess_rate = sum(guesses) / n_opportunities,
+    .groups = "drop"
+  )
+kable(bar_list_summary %>% group_by(version) %>% summarise(
+  mean_proportion_used = mean(proportion_used, na.rm = TRUE),
+  sd_proportion_used = sd(proportion_used, na.rm = TRUE),
+  mean_guess_rate = mean(guess_rate, na.rm = TRUE),
+  sd_guess_rate = sd(guess_rate, na.rm = TRUE),
+  .groups = "drop"
+), digits = 3)
+```
+
+```{r}
+plot_bar_proportion_used <- ggplot(
+  bar_list_summary,
+  aes(factor(version), proportion_used, color = factor(version))
+) +
+  geom_boxplot(
+    width = .35,
+    outlier.shape = NA,
+    color = poster_cols["ink"]
+  ) +
+  geom_jitter(width = .08, height = 0, size = 2.7, alpha = .75) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 18,
+    size = 4,
+    color = poster_cols["ink"]
+  ) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    x = "BAR version",
+    y = "Proportion of trial opportunities used for first exact answer"
+  ) +
+  mrngo_theme() +
+  theme(legend.position = "none")
+plot_bar_proportion_used
+```
+
 
 # MIC vs BAR
 
